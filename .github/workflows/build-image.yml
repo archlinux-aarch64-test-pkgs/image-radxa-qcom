@@ -67,7 +67,8 @@ jobs:
         working-directory: arch-image-builder
         run: |
           set -euo pipefail
-          sudo python build.py -p "${PRESET}"
+          sudo mkdir -p /build
+          sudo python build.py -p "${PRESET}" -o /build
 
       - name: Prepare release assets
         id: assets
@@ -91,7 +92,7 @@ jobs:
             exit 1
           fi
 
-          rootfs="arch-image-builder/build/radxa-qcom/rootfs"
+          rootfs="/build/radxa-qcom/rootfs"
           if [[ ! -d "${rootfs}/var/lib/pacman/local" ]]; then
             echo "::error::Pacman local database not found under ${rootfs}"
             exit 1

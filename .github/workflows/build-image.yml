@@ -1,0 +1,263 @@
+name: Build Radxa Qualcomm KDE Image
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  BUILDER_REPOSITORY: archlinux-aarch64-test-pkgs/arch-image-builder
+  BUILDER_REF: custom
+  PRESET: arch-ports-radxa-qcom-kde
+  IMAGE_GLOB: ArchLinux-Ports-Radxa-Qualcomm-KDE-*.7z
+
+jobs:
+  build-and-release:
+    name: Build and publish image
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 360
+    container:
+      image: ghcr.io/archlinux-aarch64-test-pkgs/build-env:latest
+      options: --privileged
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout image repository
+        uses: actions/checkout@v4
+        with:
+          path: image-radxa-qcom
+
+      - name: Checkout arch-image-builder
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.BUILDER_REPOSITORY }}
+          ref: ${{ env.BUILDER_REF }}
+          path: arch-image-builder
+
+      - name: Install image builder dependencies
+        run: |
+          set -euo pipefail
+
+          pacman -Syu --noconfirm --needed \
+            github-cli \
+            p7zip \
+            rsync \
+            wget \
+            pyalpm \
+            python-yaml \
+            python-libarchive-c \
+            libisoburn \
+            squashfs-tools \
+            erofs-utils \
+            e2fsprogs \
+            btrfs-progs \
+            dosfstools \
+            python-pip \
+            python-setuptools \
+            grub \
+            sudo \
+            jq
+
+          pacman -Scc --noconfirm || true
+
+      - name: Build image
+        working-directory: arch-image-builder
+        run: |
+          set -euo pipefail
+          sudo python build.py -p "${PRESET}"
+
+      - name: Prepare release assets
+        id: assets
+        run: |
+          set -euo pipefail
+
+          mapfile -t images < <(find arch-image-builder/build -maxdepth 1 -type f -name "${IMAGE_GLOB}" | sort)
+          if (( ${#images[@]} != 1 )); then
+            echo "::error::Expected exactly one image matching arch-image-builder/build/${IMAGE_GLOB}, found ${#images[@]}"
+            printf '%s\n' "${images[@]}"
+            exit 1
+          fi
+
+          image="${images[0]}"
+          image_name="$(basename "${image}")"
+          timestamp="${image_name#ArchLinux-Ports-Radxa-Qualcomm-KDE-}"
+          timestamp="${timestamp%.7z}"
+
+          if [[ ! "${timestamp}" =~ ^[0-9]{14}$ ]]; then
+            echo "::error::Could not parse a 14-digit timestamp from ${image_name}"
+            exit 1
+          fi
+
+          rootfs="arch-image-builder/build/radxa-qcom/rootfs"
+          if [[ ! -d "${rootfs}/var/lib/pacman/local" ]]; then
+            echo "::error::Pacman local database not found under ${rootfs}"
+            exit 1
+          fi
+
+          pkglist="arch-image-builder/build/ArchLinux-Ports-Radxa-Qualcomm-KDE-${timestamp}.pkglist.txt"
+          pacman -Q --root "${rootfs}" | LC_ALL=C sort > "${pkglist}"
+
+          {
+            echo "image=${image}"
+            echo "image_name=${image_name}"
+            echo "pkglist=${pkglist}"
+            echo "pkglist_name=$(basename "${pkglist}")"
+            echo "timestamp=${timestamp}"
+            echo "tag=v${timestamp}"
+            echo "release_title=Arch Linux Ports Radxa Qualcomm KDE ${timestamp}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Prepare release notes
+        id: notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CURRENT_PKGLIST: ${{ steps.assets.outputs.pkglist }}
+          IMAGE_NAME: ${{ steps.assets.outputs.image_name }}
+          PKGLIST_NAME: ${{ steps.assets.outputs.pkglist_name }}
+          PRESET: ${{ env.PRESET }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p release-work/previous
+          previous_tag="$(
+            gh release list \
+              --repo "${GITHUB_REPOSITORY}" \
+              --exclude-drafts \
+              --limit 1 \
+              --json tagName \
+              --jq '.[0].tagName // ""'
+          )"
+          previous_pkglist=""
+
+          if [[ -n "${previous_tag}" ]]; then
+            if gh release download "${previous_tag}" \
+                --repo "${GITHUB_REPOSITORY}" \
+                --pattern '*.pkglist.txt' \
+                --dir release-work/previous \
+                --clobber; then
+              mapfile -t previous_lists < <(find release-work/previous -maxdepth 1 -type f -name '*.pkglist.txt' | sort)
+              if (( ${#previous_lists[@]} == 1 )); then
+                previous_pkglist="${previous_lists[0]}"
+              else
+                echo "::warning::Expected one previous pkglist asset in ${previous_tag}, found ${#previous_lists[@]}"
+              fi
+            else
+              echo "::warning::Could not download previous pkglist asset from ${previous_tag}"
+            fi
+          fi
+
+          export PREVIOUS_TAG="${previous_tag}"
+          export PREVIOUS_PKGLIST="${previous_pkglist}"
+          export RELEASE_NOTES="release-work/release-notes.md"
+
+          python - <<'PY'
+          from pathlib import Path
+          import os
+
+          current_pkglist = Path(os.environ["CURRENT_PKGLIST"])
+          previous_pkglist = Path(os.environ["PREVIOUS_PKGLIST"]) if os.environ.get("PREVIOUS_PKGLIST") else None
+          previous_tag = os.environ.get("PREVIOUS_TAG", "")
+          release_notes = Path(os.environ["RELEASE_NOTES"])
+          image_name = os.environ["IMAGE_NAME"]
+          pkglist_name = os.environ["PKGLIST_NAME"]
+          preset = os.environ["PRESET"]
+
+          def load_pkglist(path: Path) -> dict[str, str]:
+              packages: dict[str, str] = {}
+              for raw_line in path.read_text(encoding="utf-8").splitlines():
+                  line = raw_line.strip()
+                  if not line:
+                      continue
+                  name, version = line.split(maxsplit=1)
+                  packages[name] = version
+              return packages
+
+          lines = [
+              "# Arch Linux Ports Radxa Qualcomm KDE Image",
+              "",
+              "**Testing status:** untested",
+              "",
+              "## Important Notices",
+              "",
+              "- This image is not officially supported by Radxa.",
+              "- This image is not suitable for production environments.",
+              "- Packages in this image come from Arch Linux Ports, not Arch Linux ARM.",
+              "",
+              "## Build",
+              "",
+              f"- Preset: `{preset}`",
+              f"- Image asset: `{image_name}`",
+              f"- Package list asset: `{pkglist_name}`",
+              "",
+              "## Package Changes",
+              "",
+          ]
+
+          if previous_pkglist is None:
+              if previous_tag:
+                  lines.append(
+                      f"Package changes compared with `{previous_tag}` are unavailable because no usable previous pkglist asset was found."
+                  )
+              else:
+                  lines.append(
+                      "Package changes are unavailable because there is no previous non-draft release with a pkglist asset."
+                  )
+          else:
+              current = load_pkglist(current_pkglist)
+              previous = load_pkglist(previous_pkglist)
+              added = sorted(set(current) - set(previous))
+              removed = sorted(set(previous) - set(current))
+              changed = sorted(name for name in set(current) & set(previous) if current[name] != previous[name])
+
+              lines.append(f"Compared with `{previous_tag}`.")
+              lines.append("")
+
+              def write_section(title: str, rows: list[str], formatter) -> None:
+                  lines.append(f"### {title} ({len(rows)})")
+                  lines.append("")
+                  if rows:
+                      for row in rows:
+                          lines.append(formatter(row))
+                  else:
+                      lines.append("None.")
+                  lines.append("")
+
+              write_section(
+                  "Added packages",
+                  added,
+                  lambda name: f"- `{name}` `{current[name]}`",
+              )
+              write_section(
+                  "Removed packages",
+                  removed,
+                  lambda name: f"- `{name}` `{previous[name]}`",
+              )
+              write_section(
+                  "Updated packages",
+                  changed,
+                  lambda name: f"- `{name}` `{previous[name]}` -> `{current[name]}`",
+              )
+
+          release_notes.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+          PY
+
+          echo "path=${RELEASE_NOTES}" >> "${GITHUB_OUTPUT}"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          gh release create "${{ steps.assets.outputs.tag }}" \
+            "${{ steps.assets.outputs.image }}" \
+            "${{ steps.assets.outputs.pkglist }}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --target "${GITHUB_SHA}" \
+            --title "${{ steps.assets.outputs.release_title }}" \
+            --notes-file "${{ steps.notes.outputs.path }}" \
+            --prerelease \
+            --latest=false

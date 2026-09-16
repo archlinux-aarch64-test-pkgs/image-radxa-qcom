@@ -9,7 +9,8 @@ permissions:
 env:
   BUILDER_REPOSITORY: archlinux-aarch64-test-pkgs/arch-image-builder
   BUILDER_REF: custom
-  PRESET: arch-ports-radxa-qcom-kde
+  NORMAL_PRESET: arch-ports-radxa-qcom-kde
+  UFS_PRESET: arch-ports-radxa-qcom-kde-ufs
   IMAGE_GLOB: ArchLinux-Ports-Radxa-Qualcomm-KDE-*.7z
 
 jobs:
@@ -63,47 +64,64 @@ jobs:
 
           pacman -Scc --noconfirm || true
 
-      - name: Build image
+      - name: Build images
         working-directory: arch-image-builder
         run: |
           set -euo pipefail
-          sudo mkdir -p /build
-          sudo python build.py -p "${PRESET}" -o /build
+          sudo mkdir -p /build/standard /build/ufs
+          sudo python build.py -C -p "${NORMAL_PRESET}" -o /build/standard -a artifacts/standard
+          sudo python build.py -C -p "${UFS_PRESET}" -o /build/ufs -a artifacts/ufs
 
       - name: Prepare release assets
         id: assets
         run: |
           set -euo pipefail
 
-          mapfile -t images < <(find arch-image-builder/build -maxdepth 1 -type f -name "${IMAGE_GLOB}" | sort)
-          if (( ${#images[@]} != 1 )); then
-            echo "::error::Expected exactly one image matching arch-image-builder/build/${IMAGE_GLOB}, found ${#images[@]}"
-            printf '%s\n' "${images[@]}"
+          mapfile -t normal_images < <(find arch-image-builder/artifacts/standard -maxdepth 1 -type f -name "${IMAGE_GLOB}" | sort)
+          if (( ${#normal_images[@]} != 1 )); then
+            echo "::error::Expected exactly one standard image, found ${#normal_images[@]}"
+            printf '%s\n' "${normal_images[@]}"
             exit 1
           fi
 
-          image="${images[0]}"
-          image_name="$(basename "${image}")"
-          timestamp="${image_name#ArchLinux-Ports-Radxa-Qualcomm-KDE-}"
+          mapfile -t ufs_images < <(find arch-image-builder/artifacts/ufs -maxdepth 1 -type f -name "${IMAGE_GLOB}" | sort)
+          if (( ${#ufs_images[@]} != 1 )); then
+            echo "::error::Expected exactly one UFS image, found ${#ufs_images[@]}"
+            printf '%s\n' "${ufs_images[@]}"
+            exit 1
+          fi
+
+          normal_source="${normal_images[0]}"
+          ufs_source="${ufs_images[0]}"
+          normal_source_name="$(basename "${normal_source}")"
+          timestamp="${normal_source_name#ArchLinux-Ports-Radxa-Qualcomm-KDE-}"
           timestamp="${timestamp%.7z}"
 
           if [[ ! "${timestamp}" =~ ^[0-9]{14}$ ]]; then
-            echo "::error::Could not parse a 14-digit timestamp from ${image_name}"
+            echo "::error::Could not parse a 14-digit timestamp from ${normal_source_name}"
             exit 1
           fi
 
-          rootfs="/build/radxa-qcom/rootfs"
+          rootfs="/build/standard/radxa-qcom/rootfs"
           if [[ ! -d "${rootfs}/var/lib/pacman/local" ]]; then
             echo "::error::Pacman local database not found under ${rootfs}"
             exit 1
           fi
 
-          pkglist="arch-image-builder/build/ArchLinux-Ports-Radxa-Qualcomm-KDE-${timestamp}.pkglist.txt"
+          mkdir -p release-work/assets
+          normal_image="release-work/assets/ArchLinux-Ports-Radxa-Qualcomm-KDE-${timestamp}.7z"
+          ufs_image="release-work/assets/ArchLinux-Ports-Radxa-Qualcomm-KDE-UFS-${timestamp}.7z"
+          pkglist="release-work/assets/ArchLinux-Ports-Radxa-Qualcomm-KDE-${timestamp}.pkglist.txt"
+
+          install -m 0644 "${normal_source}" "${normal_image}"
+          install -m 0644 "${ufs_source}" "${ufs_image}"
           pacman -Q --root "${rootfs}" | LC_ALL=C sort > "${pkglist}"
 
           {
-            echo "image=${image}"
-            echo "image_name=${image_name}"
+            echo "normal_image=${normal_image}"
+            echo "normal_image_name=$(basename "${normal_image}")"
+            echo "ufs_image=${ufs_image}"
+            echo "ufs_image_name=$(basename "${ufs_image}")"
             echo "pkglist=${pkglist}"
             echo "pkglist_name=$(basename "${pkglist}")"
             echo "timestamp=${timestamp}"
@@ -116,9 +134,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           CURRENT_PKGLIST: ${{ steps.assets.outputs.pkglist }}
-          IMAGE_NAME: ${{ steps.assets.outputs.image_name }}
+          NORMAL_IMAGE_NAME: ${{ steps.assets.outputs.normal_image_name }}
+          UFS_IMAGE_NAME: ${{ steps.assets.outputs.ufs_image_name }}
           PKGLIST_NAME: ${{ steps.assets.outputs.pkglist_name }}
-          PRESET: ${{ env.PRESET }}
+          NORMAL_PRESET: ${{ env.NORMAL_PRESET }}
+          UFS_PRESET: ${{ env.UFS_PRESET }}
         run: |
           set -euo pipefail
 
@@ -162,9 +182,11 @@ jobs:
           previous_pkglist = Path(os.environ["PREVIOUS_PKGLIST"]) if os.environ.get("PREVIOUS_PKGLIST") else None
           previous_tag = os.environ.get("PREVIOUS_TAG", "")
           release_notes = Path(os.environ["RELEASE_NOTES"])
-          image_name = os.environ["IMAGE_NAME"]
+          normal_image_name = os.environ["NORMAL_IMAGE_NAME"]
+          ufs_image_name = os.environ["UFS_IMAGE_NAME"]
           pkglist_name = os.environ["PKGLIST_NAME"]
-          preset = os.environ["PRESET"]
+          normal_preset = os.environ["NORMAL_PRESET"]
+          ufs_preset = os.environ["UFS_PRESET"]
 
           def load_pkglist(path: Path) -> dict[str, str]:
               packages: dict[str, str] = {}
@@ -183,14 +205,14 @@ jobs:
               "",
               "## Important Notices",
               "",
-              "- This image is not officially supported by Radxa.",
-              "- This image is not suitable for production environments.",
               "- Packages in this image come from Arch Linux Ports, not Arch Linux ARM.",
               "",
               "## Build",
               "",
-              f"- Preset: `{preset}`",
-              f"- Image asset: `{image_name}`",
+              f"- Standard preset: `{normal_preset}`",
+              f"- UFS preset: `{ufs_preset}`",
+              f"- Standard image asset: `{normal_image_name}`",
+              f"- UFS image asset: `{ufs_image_name}`",
               f"- Package list asset: `{pkglist_name}`",
               "",
               "## Package Changes",
@@ -254,7 +276,8 @@ jobs:
           set -euo pipefail
 
           gh release create "${{ steps.assets.outputs.tag }}" \
-            "${{ steps.assets.outputs.image }}" \
+            "${{ steps.assets.outputs.normal_image }}" \
+            "${{ steps.assets.outputs.ufs_image }}" \
             "${{ steps.assets.outputs.pkglist }}" \
             --repo "${GITHUB_REPOSITORY}" \
             --target "${GITHUB_SHA}" \
